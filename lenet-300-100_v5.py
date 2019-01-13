@@ -33,29 +33,54 @@ def create_placeholders(params):
     placeholders = { 
             'features' : tf.placeholder(tf.float32, shape=(None, n_H, n_W), name="place_X"),
             'labels' : tf.placeholder(tf.int64, shape=(None), name="place_Y"),
-            'comp_switch' : tf.placeholder(tf.bool),
+            'comp_switch' : tf.placeholder(tf.bool, name="comp_switch"),
             'tau' : tf.placeholder(tf.float32, name="tau"),
             'lambda_pi' : tf.placeholder(tf.float32, name="lambda_class_pi")
             }
     return placeholders
     
-def get_weights(params):
-    
-    units = params["units"]
+
+temp = tf.layers.Dense(units=300, activation=tf.nn.relu, name="tempname")
+sess = tf.Session()
+temp.get_weights()
+
+
+def get_weights(layers):
+        
+#    weights = [L.trainable_weights for L in layers]
     
     weights = []
-    for l in range(len(units)):
-        with tf.variable_scope("lay"+str(l), reuse=True):
-            w = tf.get_variable("kernel")
-            b = tf.get_variable("bias")
-            weights.append(tf.reshape(w, [-1]))
-            weights.append(tf.reshape(b, [-1]))
+    flat_weights = []
+#    units = [300,100]
+    for l in range(len(layers)):
+        lay_name = "lay"+str(l)+"/"
+        w = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=lay_name+"kernel:0")[0]
+        b = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=lay_name+"bias:0")[0]
+        weights.extend([w, b])
+##        with tf.variable_scope("lay"+str(l), reuse=True):
+##            w = tf.get_variable("kernel")
+##            b = tf.get_variable("bias")
+        flat_weights.append(tf.reshape(w, [-1]))
+        flat_weights.append(tf.reshape(b, [-1]))
             
-    weights = tf.concat(weights,axis=0)
+    flat_weights = tf.concat(flat_weights,axis=0)
     
-    return weights
+    return (flat_weights, weights)
 
-def nn_model(placeholders, params):
+def create_nn_model(params):
+    
+    units = params["units"]
+    n_y = params["n_y"]
+    
+    layers = []
+    for l in range(len(units)):
+        layer = tf.layers.Dense(units=units[l], activation=tf.nn.relu, name="lay"+str(l))
+        layers.append(layer)
+        
+    layers.append(tf.layers.Dense(n_y, activation=None, name="lay"+str(len(units))))
+    return layers
+
+def nn_model(placeholders, layers, params):
     
     features = placeholders['features']    
     units = params["units"]
@@ -64,11 +89,10 @@ def nn_model(placeholders, params):
     n_W = params["n_W"]
     
     net = tf.reshape(features, [-1, n_H * n_W])
-    for l in range(len(units)):
-        net = tf.layers.dense(net, units=units[l], activation=tf.nn.relu, name="lay"+str(l))
+    for L in layers:
+        net = L.apply(net)
         
-    logits = tf.layers.dense(net, n_y, activation=None)
-    return logits
+    return net
 
 def create_compression_priors(params):
     
@@ -87,21 +111,21 @@ def create_compression_priors(params):
 def set_compression_priors(weights, priors, params):
     
     n_classes = params["n_classes"]
-    log_pi0 = params["log_pi0"]
+    p0 = params["p0"]
         
     mu = tf.linspace(tf.reduce_min(weights), tf.reduce_max(weights), n_classes)
     mu = tf.concat([tf.Variable([0.]), mu], axis=0) # as specified in the paper, mu0=0
 
-    single_gamma = tf.log((tf.reduce_max(weights)-tf.reduce_min(weights))/float(n_classes-1)*1.0)
+    single_gamma = tf.log((tf.reduce_max(weights)-tf.reduce_min(weights))/float(n_classes)*1.0)
     single_gamma = tf.reshape(single_gamma,[1, 1])
     gamma = tf.tile(single_gamma, multiples = [1, n_classes+1])
     gamma = tf.reshape(gamma, [-1])
     
-    single_pi = tf.log(1.-log_pi0) - tf.log(float(n_classes))
+    single_pi = tf.log(1.-p0) - tf.log(float(n_classes))
     single_pi = tf.reshape(single_pi, [1,1])
     pi = tf.tile(single_pi, multiples = [1, n_classes])
     pi = tf.reshape(pi, [-1])
-    pi = tf.concat([tf.Variable([math.log(log_pi0)]), pi], axis=0) # as specified in the paper
+    pi = tf.concat([tf.Variable([tf.log(p0)]), pi], axis=0) # as specified in the paper
     
     priors_assign = {
             "pi"    : tf.assign(priors["pi"], pi),
@@ -120,7 +144,7 @@ def calculate_compression(placeholders, weights, priors, params):
     lam_pi = placeholders["lambda_pi"]
     
     n_classes = params["n_classes"]
-    log_pi0 = params["log_pi0"]
+    p0 = params["p0"]
     
     pi      = priors["pi"]
     gamma   = priors["gamma"]
@@ -132,15 +156,15 @@ def calculate_compression(placeholders, weights, priors, params):
     mu = tf.concat([tf.Variable([0.]), mu], axis=0) # as specified in the paper, mu0=0
     pi = tf.slice(pi,[1], [n_classes]) # drop the 0th class
     probs_excl_zeroth = tf.reduce_sum(tf.exp(pi))
-    pi = tf.concat([tf.Variable([math.log(log_pi0)]), pi], axis=0) # as specified in the paper
+    pi = tf.concat([tf.Variable([tf.log(p0)]), pi], axis=0) # as specified in the paper
     
     D2 = - 0.5 / sigma2 * tf.squared_difference(tf.expand_dims(weights,axis=-1), mu) 
     logL = pi - 0.5 * gamma + D2
-    loss = - tf.reduce_logsumexp(logL, axis=1)
-    loss = tf.reduce_mean(loss)
-    loss = loss + lam_pi * tf.square(probs_excl_zeroth + tf.exp(log_pi0) - 1) # Lagrangian to ensure probs sum to 1
+    NLL = - tf.reduce_logsumexp(logL, axis=1)
+    loss = tf.reduce_mean(NLL)
+    loss = loss + lam_pi * tf.square(probs_excl_zeroth + p0 - 1) # Lagrangian to ensure probs sum to 1
     
-    return loss
+    return (loss, NLL, D2)
     
 def eval_model(placeholders, logits, weights, params, priors = None):
     
@@ -149,15 +173,22 @@ def eval_model(placeholders, logits, weights, params, priors = None):
     tau = placeholders['tau']
     
     err_loss    = tf.losses.sparse_softmax_cross_entropy(labels=labels,logits=logits)
-    comp_loss   = tf.cond(comp_switch, 
+    comp_loss, NLL, D2   = tf.cond(comp_switch, 
                           lambda : calculate_compression(placeholders, weights, priors, params),
-                          lambda : 0.)
+                          lambda : (0., 0., 0.))
     loss = err_loss + tau * comp_loss
     
     preds = tf.argmax(logits, 1)
     accuracy = tf.metrics.accuracy(labels, preds)
     
-    return (loss, err_loss, comp_loss, accuracy)
+    return (loss, err_loss, comp_loss, accuracy, NLL, D2)
+
+def clip_pi(priors):
+    
+    pi = priors["pi"]
+    clipped_pi = tf.minimum(pi, tf.zeros_like(pi))
+    return tf.assign(pi, clipped_pi)
+    
 
 def variable_summaries(var):
     """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
@@ -184,6 +215,28 @@ def all_summaries(weights, priors):
         
     return tf.summary.merge_all()
 
+def get_optimisation_op(trainable_variables ,learning_rates, loss):
+    
+    assert(len(trainable_variables) == len(learning_rates))
+    optimizer = tf.train.AdamOptimizer(learning_rate=1.)
+    grads_and_vars = optimizer.compute_gradients(loss, var_list = trainable_variables)
+#    new_grads_and_vars = []
+#    for i in range(len(grads_and_vars)):
+#        lr = learning_rates[i]
+#        grad = grads_and_vars[i][0]
+#        var = grads_and_vars[i][1]
+#        new_grads_and_vars.append((lr * grad, var))
+#        
+#    print(new_grads_and_vars)
+#        
+    grads_and_vars = [(r * gv[0], gv[1]) for r, gv in zip(learning_rates, grads_and_vars)]
+    optimizer_op = optimizer.apply_gradients(grads_and_vars)
+    return (optimizer, optimizer_op)
+    
+#    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rates[0])
+#    return (optimizer, optimizer.minimize(loss, var_list = trainable_variables))
+    
+
 tf.reset_default_graph()
 params = {
         "minibatch_size" : 300,
@@ -192,22 +245,32 @@ params = {
         "n_y" : 10,
         "units" : [300, 100],
         "n_classes" : 16,
-        "log_pi0" : 0.99
+        "p0" : 0.99
         }
 placeholders = create_placeholders(params)
 priors = create_compression_priors(params)
-logits = nn_model(placeholders, params)
-weights = get_weights(params)
-priors_assign = set_compression_priors(weights, priors, params)
-eval_tensors = eval_model(placeholders, logits, weights, params, priors)
+layers = create_nn_model(params)
+logits = nn_model(placeholders, layers, params)
+flat_weights, weights = get_weights(layers)
+priors_assign = set_compression_priors(flat_weights, priors, params)
+eval_tensors = eval_model(placeholders, logits, flat_weights, params, priors)
 total_loss  = eval_tensors[0]
 err_loss    = eval_tensors[1]
 comp_loss   = eval_tensors[2]
 accuracy    = eval_tensors[3]
-summary = all_summaries(weights, priors)
-optimizer = tf.train.AdamOptimizer(learning_rate=0.005)
-optimizer_op = optimizer.minimize(total_loss)
-
+summary = all_summaries(flat_weights, priors)
+trainable_variables = [w for w in weights]
+#trainable_variables.extend([priors["pi"], priors["mu"], priors["gamma"]])
+#len(trainable_variables)
+learning_rates = [0.001] * 6 + [5E-4] * 3
+learning_rates = [0.001] * 6 
+optimizer, optimizer_op = get_optimisation_op(
+        trainable_variables,
+        learning_rates,
+        total_loss)
+#optimizer = tf.train.AdamOptimizer(learning_rate=1)
+#optimizer_op = optimizer.minimize(total_loss)
+clip_pi_op = clip_pi(priors)
 
 def set_minibatch(feed_dict, placeholders, data, params = None, i = None):
     
@@ -223,27 +286,27 @@ def set_minibatch(feed_dict, placeholders, data, params = None, i = None):
 
 feed_dict = {
         placeholders["comp_switch"] : False,
-        placeholders["tau"]         : 0.005,
+        placeholders["tau"]         : 0.05,
         placeholders["lambda_pi"]   : 1
         }
 
 weights_save = {}
 sess = tf.Session()
 
-train_writer = tf.summary.FileWriter(r"C:\Users\bradley.tjandra\Documents\AI\SoftWeightSharing\Training\20190106", sess.graph)    
-sess.run(tf.global_variables_initializer())
+#train_writer = tf.summary.FileWriter(r"C:\Users\bradley.tjandra\Documents\AI\SoftWeightSharing\Training\20190106_6", sess.graph)    
+sess.run(tf.global_variables_initializer(),feed_dict={placeholders["comp_switch"] : True})
 sess.run(tf.local_variables_initializer())
-minibatch_size = params['minibatch_size']
+minibatch_size = params['minibatch_size']   
 
 # training without compression
 for epoch in range(30):
     
-    data = helper.shuffle_in_unison([X_train, Y_train], index=0, seed = epoch)
+    data = helper.shuffle_in_unison([X_train, Y_train], index=0, seed=epoch)
     
     # minibatches
     for i in range(int(X_train.shape[0] / minibatch_size)):
         feed_dict = set_minibatch(feed_dict, placeholders, data, params, i)
-        _, total_loss_val = sess.run((optimizer_op, total_loss), feed_dict = feed_dict)
+        sess.run(optimizer_op, feed_dict = feed_dict)
     
     # test results
     feed_dict = set_minibatch(feed_dict, placeholders, [test_data, test_labels])
@@ -253,13 +316,12 @@ for epoch in range(30):
 #    if epoch % 10 == 0:
 #        train_writer.add_summary(summ_vals, epoch)
 
-weights_save["Pre Compression"] = sess.run(weights)
-
+weights_save["Pre Compression"] = sess.run(flat_weights)
 
 # training with compression
 feed_dict[placeholders["comp_switch"]] = True
 sess.run(priors_assign) 
-for epoch in range(10):
+for epoch in range(30):
     
     data = helper.shuffle_in_unison([X_train, Y_train], index=0, seed=epoch)
     
@@ -271,34 +333,18 @@ for epoch in range(10):
     # test results
     feed_dict = set_minibatch(feed_dict, placeholders, [test_data, test_labels])
     summ_vals, eval_vals = sess.run((summary,eval_tensors), feed_dict = feed_dict)
+    sess.run(clip_pi_op)
     print("Test accuracy after epoch {} / 30: {}".format(epoch, eval_vals[3][1]))
     print("Loss: {}, Error: {}, Compression: {}".format(eval_vals[0], eval_vals[1], eval_vals[2]))
-#    if epoch % 10 == 0:
-#        train_writer.add_summary(summ_vals, epoch+30)
-#        weights_save["Compression" + str(epoch)] = sess.run(weights)
-#        plt.scatter(weights_save["Pre Compression"], weights_save["Compression" + str(epoch)])
+    if epoch % 5 == 0:
+        train_writer.add_summary(summ_vals, epoch+30)
+        weights_save["Compression" + str(epoch)] = sess.run(flat_weights)
+        plt.scatter(weights_save["Pre Compression"], weights_save["Compression" + str(epoch)])
 
-weights_save["Post Compression"] = sess.run(weights)
+weights_save["Post Compression"] = sess.run(flat_weights)
 plt.scatter(weights_save["Pre Compression"], weights_save["Post Compression"])
-print(np.exp(sess.run(priors["gamma"])))
 sess.close()
 
-grads = optimizer.compute_gradients(total_loss, var_list=[weights, priors["mu"]])
-#feed_dict[placeholders["tau"]] = -0.005
-#feed_dict[placeholders["lambda_pi"]] = 0.
-grad_vals = sess.run(grads, feed_dict=feed_dict)
-#import pandas as pd
-dat = pd.DataFrame(grad_vals[1][0], grad_vals[1][1])
-grad_vals[1][1]
-print(grad_vals[1][0])
-np.argmax(grad_vals[0][1])
-print(grad_vals[0][0][252600])
-print(grad_vals[0][1][252600])
-
-
-
 sess.run(priors["mu"])
-sum(np.exp(sess.run(priors["pi"])))
-np.sum(sess.run(priors["class_prob"]))
 
 tensorboard --logdir="C:\Users\bradley.tjandra\Documents\AI\SoftWeightSharing\Training"
